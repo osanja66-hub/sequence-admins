@@ -1,3 +1,4 @@
+// admin (6).js
 const express = require('express');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
@@ -23,6 +24,17 @@ const Withdrawal = mongoose.models.Withdrawal || mongoose.model('Withdrawal', ne
 const Notification = mongoose.models.Notification || mongoose.model('Notification', new mongoose.Schema({}, { collection: 'notifications', strict: false }));
 const Log = mongoose.models.Log || mongoose.model('Log', new mongoose.Schema({}, { collection: 'logs', strict: false }));
 const Setting = mongoose.models.Setting || mongoose.model('Setting', new mongoose.Schema({}, { collection: 'settings', strict: false }));
+
+// New persistent audit model (tracked clicks / login/register events)
+const LoginAudit = mongoose.models.LoginAudit || mongoose.model('LoginAudit', new mongoose.Schema({
+    userId: String,
+    username: String,
+    event: String, // 'login' | 'register' | other
+    ip: String,
+    geo: mongoose.Schema.Types.Mixed,
+    userAgent: String,
+    createdAt: { type: String, default: () => new Date().toISOString() }
+}, { collection: 'loginaudit', strict: false }));
 
 // ========== Cloudinary Config ==========
 cloudinary.config({
@@ -674,6 +686,50 @@ router.get('/users/:username', asyncHandler(async (req, res) => {
     res.json({ success: true, user });
 }));
 
+// ----------------------- NEW: Update single user's credit score (admin panel) -----------------------
+router.patch('/users/:username/credit_score', asyncHandler(async (req, res) => {
+    const { username } = req.params;
+    const { creditScore } = req.body;
+
+    if (typeof creditScore === 'undefined') {
+        return res.status(400).json({ success: false, message: 'creditScore is required in request body' });
+    }
+
+    const val = Number(creditScore);
+    if (!Number.isFinite(val) || val < 0 || val > 100) {
+        return res.status(400).json({ success: false, message: 'creditScore must be a number between 0 and 100.' });
+    }
+
+    const user = await User.findOne({ username });
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    user.creditScore = val;
+    try {
+        // keep legacy field name for compatibility
+        user.credit_score = val;
+    } catch (e) {
+        // ignore if strict prevents it
+    }
+
+    await user.save();
+
+    // Audit log (best-effort)
+    try {
+        await Log.create({
+            type: 'admin_credit_update',
+            admin: 'admin', // token-based admin identity not included here
+            username: user.username,
+            userId: String(user._id),
+            newCreditScore: val,
+            createdAt: new Date().toISOString()
+        });
+    } catch (e) {
+        console.warn('Failed to create credit update log:', e && e.message ? e.message : e);
+    }
+
+    return res.json({ success: true, message: 'Credit score updated.', user: { username: user.username, id: user._id, creditScore: val } });
+}));
+
 router.post('/reset-user-task-set', asyncHandler(async (req, res) => {
     const { username } = req.body;
     if (!username) return res.status(400).json({ success: false, message: 'Username is required' });
@@ -1062,6 +1118,224 @@ router.get('/export-logs-csv', asyncHandler(async (_, res) => {
     res.setHeader('Content-Disposition', 'attachment; filename=logs.csv');
     res.setHeader('Content-Type', 'text/csv');
     res.send(csv);
+}));
+
+// ----------------------- NEW: Tracked Clicks / LoginAudit endpoints -----------------------
+/**
+ * GET /tracked-clicks
+ * Query params:
+ *  - limit (default 200)
+ *  - username (optional)
+ *  - event (optional)
+ *  - from, to (ISO date strings optional)
+ */
+router.get('/tracked-clicks', asyncHandler(async (req, res) => {
+    const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 200));
+    const filter = {};
+    if (req.query.username) filter.username = String(req.query.username).trim();
+    if (req.query.event) filter.event = String(req.query.event).trim();
+    if (req.query.from || req.query.to) {
+        filter.createdAt = {};
+        if (req.query.from) {
+            const fromDate = new Date(req.query.from);
+            if (!isNaN(fromDate)) filter.createdAt.$gte = fromDate.toISOString();
+        }
+        if (req.query.to) {
+            const toDate = new Date(req.query.to);
+            if (!isNaN(toDate)) filter.createdAt.$lte = toDate.toISOString();
+        }
+        if (Object.keys(filter.createdAt).length === 0) delete filter.createdAt;
+    }
+
+    const items = await LoginAudit.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+    res.json({ success: true, data: items });
+}));
+
+/**
+ * GET /tracked-clicks/export
+ * Exports CSV for matching entries (same query params)
+ */
+router.get('/tracked-clicks/export', asyncHandler(async (req, res) => {
+    const limit = Math.min(10000, Math.max(1, Number(req.query.limit) || 1000));
+    const filter = {};
+    if (req.query.username) filter.username = String(req.query.username).trim();
+    if (req.query.event) filter.event = String(req.query.event).trim();
+    if (req.query.from || req.query.to) {
+        filter.createdAt = {};
+        if (req.query.from) {
+            const fromDate = new Date(req.query.from);
+            if (!isNaN(fromDate)) filter.createdAt.$gte = fromDate.toISOString();
+        }
+        if (req.query.to) {
+            const toDate = new Date(req.query.to);
+            if (!isNaN(toDate)) filter.createdAt.$lte = toDate.toISOString();
+        }
+        if (Object.keys(filter.createdAt).length === 0) delete filter.createdAt;
+    }
+
+    const items = await LoginAudit.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+
+    // Compose CSV
+    const headers = ['createdAt','event','username','userId','ip','city','region','country','isp','userAgent'];
+    const rows = items.map(it => {
+        const geo = it.geo || {};
+        return [
+            it.createdAt || '',
+            it.event || '',
+            it.username || '',
+            it.userId || '',
+            it.ip || '',
+            geo.city || '',
+            geo.regionName || '',
+            geo.country || '',
+            geo.isp || '',
+            (it.userAgent || '').replace(/"/g, '""')
+        ].map(v => `"${String(v || '').replace(/"/g, '""')}"`).join(',');
+    });
+    const csv = [headers.join(','), ...rows].join('\n');
+    res.setHeader('Content-Disposition', 'attachment; filename=tracked_clicks.csv');
+    res.setHeader('Content-Type', 'text/csv');
+    res.send(csv);
+}));
+
+/**
+ * DELETE /tracked-clicks/:id
+ * Delete a single LoginAudit record by _id
+ */
+router.delete('/tracked-clicks/:id', asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ success: false, message: 'Missing id' });
+    // allow string ObjectId or plain string id
+    const q = { $or: [{ _id: id }, { _id: mongoose.Types.ObjectId.isValid(id) ? mongoose.Types.ObjectId(id) : null }] };
+    // sanitize q to avoid null in $or
+    const or = q.$or.filter(Boolean);
+    const result = await LoginAudit.deleteOne({ $or: or });
+    if (!result || result.deletedCount === 0) return res.status(404).json({ success: false, message: 'Record not found' });
+    res.json({ success: true, message: 'Deleted' });
+}));
+
+/**
+ * POST /tracked-clicks/bulk-delete
+ * Body: { ids: [id1, id2, ...] }
+ */
+router.post('/tracked-clicks/bulk-delete', asyncHandler(async (req, res) => {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ success: false, message: 'ids array required' });
+    const objectIds = ids.filter(Boolean).map(id => (mongoose.Types.ObjectId.isValid(id) ? mongoose.Types.ObjectId(id) : null)).filter(Boolean);
+    const stringIds = ids.filter(id => !mongoose.Types.ObjectId.isValid(id));
+    const cond = { $or: [] };
+    if (objectIds.length) cond.$or.push({ _id: { $in: objectIds } });
+    if (stringIds.length) cond.$or.push({ _id: { $in: stringIds } });
+    if (!cond.$or.length) return res.status(400).json({ success: false, message: 'No valid ids found' });
+
+    const result = await LoginAudit.deleteMany(cond);
+    res.json({ success: true, deletedCount: result.deletedCount || 0 });
+}));
+
+/**
+ * Serve the admin-panel IP page (static HTML placed under ../public/admin-panel/ip.html)
+ * The admin frontend can link to /admin/ip.html (router mount path assumed to be /admin)
+ */
+router.get('/ip.html', (req, res) => {
+    const filePath = path.join(__dirname, '..', 'public', 'admin-panel', 'ip.html');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    // prevent caching so admin sees latest content
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, max-age=0');
+    res.sendFile(filePath, (err) => {
+        if (err) {
+            console.error('Failed to send /admin/ip.html:', err);
+            res.status(404).send('<!doctype html><html><body><h3>ip.html not found</h3></body></html>');
+        }
+    });
+});
+
+// ----------------------- remaining endpoints unchanged -----------------------
+
+// ======================== NEW: Service-links read/write endpoints ========================
+const SERVICE_LINKS_FILE = path.join(__dirname, '..', 'public', 'service-links.json');
+
+/**
+ * GET /service-links
+ * Returns service links JSON. Prefer DB stored Setting.serviceLinks, fallback to file.
+ */
+router.get('/service-links', asyncHandler(async (req, res) => {
+  try {
+    const settingsDoc = await Setting.findOne({}).lean();
+    if (settingsDoc && settingsDoc.serviceLinks) {
+      return res.json({ success: true, source: 'db', data: settingsDoc.serviceLinks });
+    }
+    // fallback: read file
+    try {
+      const raw = fs.readFileSync(SERVICE_LINKS_FILE, 'utf8');
+      const parsed = JSON.parse(raw);
+      return res.json({ success: true, source: 'file', data: parsed });
+    } catch (fileErr) {
+      return res.status(404).json({ success: false, message: 'No service links found (DB empty and file missing)' });
+    }
+  } catch (err) {
+    console.error('GET /admin/service-links error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to read service links' });
+  }
+}));
+
+/**
+ * POST /service-links
+ * Body: JSON object to persist as service links.
+ * Persists into Setting.serviceLinks and attempts to write file public/service-links.json (best-effort).
+ */
+router.post('/service-links', asyncHandler(async (req, res) => {
+  try {
+    const payload = req.body;
+    if (!payload || typeof payload !== 'object') {
+      return res.status(400).json({ success: false, message: 'Expected JSON object in request body' });
+    }
+
+    const saved = await Setting.findOneAndUpdate({}, { $set: { serviceLinks: payload } }, { upsert: true, new: true });
+
+    try {
+      fs.writeFileSync(SERVICE_LINKS_FILE, JSON.stringify(payload, null, 2), 'utf8');
+    } catch (fsErr) {
+      console.warn('Warning: could not write service-links.json to disk:', fsErr && fsErr.message ? fsErr.message : fsErr);
+    }
+
+    return res.json({ success: true, message: 'Service links saved', data: saved.serviceLinks || payload });
+  } catch (err) {
+    console.error('POST /admin/service-links error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to save service links' });
+  }
+}));
+
+/**
+ * POST /service-links/delete-keys
+ * Body: { keys: ['k1','k2'] } - deletes specified keys from serviceLinks map (DB + file).
+ */
+router.post('/service-links/delete-keys', asyncHandler(async (req, res) => {
+  try {
+    const { keys } = req.body;
+    if (!Array.isArray(keys)) return res.status(400).json({ success: false, message: 'keys array required' });
+
+    const settingsDoc = await Setting.findOne({}) || {};
+    const current = settingsDoc.serviceLinks || {};
+
+    let changed = false;
+    for (const k of keys) {
+      if (Object.prototype.hasOwnProperty.call(current, k)) {
+        delete current[k];
+        changed = true;
+      }
+    }
+
+    if (!changed) return res.json({ success: true, message: 'No keys removed', data: current });
+
+    const saved = await Setting.findOneAndUpdate({}, { $set: { serviceLinks: current } }, { upsert: true, new: true });
+
+    try { fs.writeFileSync(SERVICE_LINKS_FILE, JSON.stringify(current, null, 2), 'utf8'); } catch(e) { console.warn('file write failed', e); }
+
+    return res.json({ success: true, message: 'Keys removed', data: saved.serviceLinks || current });
+  } catch (err) {
+    console.error('POST /admin/service-links/delete-keys error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to delete keys' });
+  }
 }));
 
 module.exports = router;
