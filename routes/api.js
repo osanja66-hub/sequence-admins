@@ -39,15 +39,7 @@ const userSchema = new mongoose.Schema({
   signState: { type: mongoose.Schema.Types.Mixed, default: { signedCount: 0, lastSignDate: null } },
 
   // Manual reset flag: user requests reset for next set (must be processed by admin or via explicit endpoint)
-  resetRequested: { type: Boolean, default: false },
-
-  // Persisted frozen amount so frontend can show deducted amount across refreshes.
-  frozenAmount: { type: Number, default: 0 },
-
-  // Credit score & admin flag (NEW)
-  creditScore: { type: Number, default: 100 }, // 0-100, default 100
-  isAdmin: { type: Boolean, default: false },
-
+  resetRequested: { type: Boolean, default: false }
 }, { collection: 'users', strict: false });
 
 const User = mongoose.models.User || mongoose.model('User', userSchema);
@@ -60,19 +52,6 @@ const Notification = mongoose.models.Notification || mongoose.model('Notificatio
 const Transaction = mongoose.models.Transaction || mongoose.model('Transaction', new mongoose.Schema({}, { collection: 'transactions', strict: false }));
 const LinkClick = mongoose.models.LinkClick || mongoose.model('LinkClick', new mongoose.Schema({}, { collection: 'linkclicks', strict: false }));
 const Setting = mongoose.models.Setting || mongoose.model('Setting', new mongoose.Schema({}, { collection: 'settings', strict: false }));
-
-// New: LoginAudit model for persistent audit of register/login events
-const LoginAudit = mongoose.models.LoginAudit || mongoose.model('LoginAudit',
-  new mongoose.Schema({
-    userId: String,
-    username: String,
-    event: String, // 'login' | 'register' | other
-    ip: String,
-    geo: mongoose.Schema.Types.Mixed,
-    userAgent: String,
-    createdAt: { type: String, default: () => new Date().toISOString() }
-  }, { collection: 'loginaudit', strict: false })
-);
 
 // --- Session model to support multiple concurrent logins per user (one session per device/login) ---
 const sessionSchema = new mongoose.Schema({
@@ -94,119 +73,6 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET || 'zeU4nedVzVzvqqndh2MF82AdRiI',
     secure: true
 });
-
-// ---------------- Admin notification helpers (Telegram / Slack) ----------------
-// Place your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in environment variables.
-// Optional: SLACK_WEBHOOK_URL for Slack notifications.
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || "";
-
-// Normalize IP helpers (handles ::ffff: IPv4 mapped addresses)
-function normalizeIp(ip) {
-  if (!ip) return "";
-  const s = String(ip).trim();
-  // match IPv4 inside IPv6 mapped (::ffff:1.2.3.4)
-  const m = s.match(/(?:.*:)?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/);
-  return m ? m[1] : s;
-}
-
-// Robust extraction of client IP from request (x-forwarded-for, x-real-ip, req.ip, connection, socket)
-function getClientIp(req) {
-  try {
-    const xf = req.headers['x-forwarded-for'] || req.headers['X-Forwarded-For'];
-    if (xf && typeof xf === 'string') {
-      const parts = xf.split(',').map(s => s.trim()).filter(Boolean);
-      if (parts.length) return normalizeIp(parts[0]);
-    }
-    const xr = req.headers['x-real-ip'] || req.headers['X-Real-Ip'];
-    if (xr) return normalizeIp(xr);
-    if (req.ip) return normalizeIp(req.ip);
-    if (req.connection && req.connection.remoteAddress) return normalizeIp(req.connection.remoteAddress);
-    if (req.socket && req.socket.remoteAddress) return normalizeIp(req.socket.remoteAddress);
-    return "";
-  } catch (e) {
-    return "";
-  }
-}
-
-// Best-effort geo lookup using ip-api.com (free service, rate-limited). Returns object or null.
-async function getGeoForIp(ip) {
-  if (!ip) return null;
-  try {
-    const url = `http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,country,regionName,city,zip,lat,lon,isp,org,query,message`;
-    const r = await axios.get(url, { timeout: 2500 });
-    if (r && r.data && r.data.status === "success") {
-      return r.data;
-    }
-    return null;
-  } catch (e) {
-    return null;
-  }
-}
-
-// Fire-and-forget admin notification (Telegram + optional Slack). Minimal info only.
-// Modified: accept extra.geo and extra.userAgent to avoid recomputing different values.
-async function notifyAdmin({ event = "unknown", user = {}, req = null, extra = {} } = {}) {
-  try {
-    const ip = extra.ip || (req ? getClientIp(req) : (extra.ip || "unknown"));
-    const geo = extra.geo || (await getGeoForIp(ip));
-    const time = new Date().toISOString();
-
-    // Build readable location snippet
-    let locationText = "";
-    if (geo) {
-      locationText = `${geo.city || ""}${geo.regionName ? ", " + geo.regionName : ""}${geo.country ? ", " + geo.country : ""}`.replace(/^, /, "");
-      if (geo.isp) locationText += ` — ${geo.isp}`;
-    } else if (extra.location) {
-      locationText = String(extra.location);
-    } else {
-      locationText = "Location not available";
-    }
-
-    // Minimal user info (avoid sensitive fields)
-    const usernameLine = `username: ${user.username || user.user || user.name || ""}`;
-    const userIdLine = `userId: ${user._id || user.id || ""}`;
-
-    const ua = extra.userAgent || (req ? (req.headers['user-agent'] || '') : '');
-    let mapsLink = "";
-    if (geo && geo.lat && geo.lon) {
-      mapsLink = `\nMap: https://www.google.com/maps/search/?api=1&query=${geo.lat},${geo.lon}`;
-    }
-
-    const eventLine = `<b>${event.toUpperCase()}</b>`;
-    const message = `${eventLine}\n${usernameLine}\n${userIdLine}\nIP: <code>${ip}</code>\nLocation: ${locationText}${mapsLink}\nUser-Agent: ${ua}\nTime: ${time}`;
-
-    // Telegram
-    if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-      try {
-        const tgUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-        await axios.post(tgUrl, {
-          chat_id: TELEGRAM_CHAT_ID,
-          text: message,
-          parse_mode: "HTML",
-        }, { timeout: 3000 });
-      } catch (e) {
-        console.warn('notifyAdmin: telegram send failed', e && e.message ? e.message : e);
-      }
-    }
-
-    // Slack (optional)
-    if (SLACK_WEBHOOK_URL) {
-      try {
-        const slackText = `${event.toUpperCase()} — ${user.username || user._id || ""}\nIP: ${ip}\nLocation: ${locationText}\nTime: ${time}`;
-        await axios.post(SLACK_WEBHOOK_URL, { text: slackText }, { timeout: 3000 });
-      } catch (e) {
-        console.warn('notifyAdmin: slack send failed', e && e.message ? e.message : e);
-      }
-    }
-
-    console.log(`notifyAdmin: ${event} ${user.username || user._id || ''} ip=${ip} loc=${locationText}`);
-  } catch (err) {
-    console.error('notifyAdmin error:', err && err.message ? err.message : err);
-  }
-}
-// ---------------- end notification helpers ----------------
 
 // ========== Product cache & helpers (pre-warm + in-flight dedupe + periodic refresh) ==========
 const CLOUDINARY_CACHE_DURATION = 1000 * 60 * 5; // 5 minutes
@@ -493,9 +359,7 @@ async function getOrCreateSettings() {
       platformClosed: false,
       autoOpenHourUK: 10,
       whoCanAccessDuringClose: [],
-      service: { whatsapp: "", telegram: "" },
-      // ensure we also persist a serviceLinks shape for frontend compatibility
-      serviceLinks: { whatsapp: "", telegram: "" }
+      service: { whatsapp: "", telegram: "" }
     });
   } else {
     const updates = {};
@@ -503,8 +367,6 @@ async function getOrCreateSettings() {
     if (typeof settings.autoOpenHourUK === 'undefined') updates.autoOpenHourUK = 10;
     if (!Array.isArray(settings.whoCanAccessDuringClose)) updates.whoCanAccessDuringClose = [];
     if (!settings.service) updates.service = { whatsapp: "", telegram: "" };
-    // Ensure serviceLinks exists for newer frontend integrations
-    if (typeof settings.serviceLinks === 'undefined') updates.serviceLinks = { whatsapp: "", telegram: "" };
     if (Object.keys(updates).length) {
       await Setting.updateOne({ _id: settings._id }, { $set: updates });
       settings = await Setting.findById(settings._id);
@@ -692,23 +554,13 @@ router.get('/settings', async (req, res) => {
 
         // Platform closing aliases for compatibility with frontend
         const autoOpenHour = (typeof settings.autoOpenHourUK === 'number') ? settings.autoOpenHourUK : 10;
-        const hh = String(autoOpenHour).padStart(2, "0");
+        const hh = String(autoOpenHour).padStart(2, '0');
         const autoOpenTime = `${hh}:00`;
 
         const allowList = Array.isArray(settings.whoCanAccessDuringClose) ? settings.whoCanAccessDuringClose : [];
 
-        // SERVICE LINKS: prefer explicit settings.serviceLinks, otherwise derive from settings.service (legacy)
-        const serviceLinks = (settings && (settings.serviceLinks || settings.contactLinks))
-          ? (settings.serviceLinks || settings.contactLinks)
-          : {
-              whatsapp: (settings && settings.service && settings.service.whatsapp) ? settings.service.whatsapp : "",
-              telegram: (settings && settings.service && settings.service.telegram) ? settings.service.telegram : ""
-            };
-
         res.json({
             service: settings && settings.service ? settings.service : { whatsapp: "", telegram: "" },
-            // include explicit serviceLinks object for frontends that expect it
-            serviceLinks,
             platformClosed: !!settings.platformClosed,
             autoOpenHourUK: autoOpenHour,
             autoOpenTime,
@@ -779,52 +631,13 @@ router.post('/users/register', async (req, res) => {
         suspended: false,
         token: crypto.randomBytes(24).toString('hex'),
         createdAt: new Date().toISOString(),
-        currentSet: 1,
-        frozenAmount: 0,
-        // ensure new users start at full credit
-        creditScore: 100,
-        isAdmin: false
+        currentSet: 1
     };
 
     // Ensure _id is provided because the schema declares _id: String (Mongoose won't auto-generate a string _id)
     try {
       newUser._id = newUser._id || crypto.randomBytes(12).toString('hex');
       const created = await User.create(newUser);
-
-      // Determine canonical ip/userAgent/geo for this request and use the same for notify and audit
-      const ipAddr = getClientIp(req) || '';
-      const ua = req.headers['user-agent'] || '';
-      const geo = await getGeoForIp(ipAddr);
-
-      // Notify admin (fire-and-forget) about new registration
-      (async () => {
-        try {
-          await notifyAdmin({
-            event: "user_registered",
-            user: { username: created.username, _id: created._id },
-            req,
-            extra: { ip: ipAddr, userAgent: ua, geo, location: geo ? `${geo.city || ''}${geo.regionName ? ', ' + geo.regionName : ''}${geo.country ? ', ' + geo.country : ''}` : '' }
-          });
-        } catch (e) { /* ignore notify errors */ }
-      })();
-
-      // Persist audit record (fire-and-forget)
-      (async () => {
-        try {
-          await LoginAudit.create({
-            userId: created._id,
-            username: created.username,
-            event: 'register',
-            ip: ipAddr,
-            geo,
-            userAgent: ua,
-            createdAt: new Date().toISOString()
-          });
-        } catch (e) {
-          console.warn('LoginAudit create failed (register):', e && e.message ? e.message : e);
-        }
-      })();
-
       return res.json({ success: true, user: created });
     } catch (err) {
       console.error('users/register create error:', err && err.stack ? err.stack : err);
@@ -834,45 +647,10 @@ router.post('/users/register', async (req, res) => {
         try {
           newUser._id = crypto.randomBytes(16).toString('hex');
           const created2 = await User.create(newUser);
-
-          // Determine canonical ip/userAgent/geo for this request (retry branch)
-          const ipAddr = getClientIp(req) || '';
-          const ua = req.headers['user-agent'] || '';
-          const geo = await getGeoForIp(ipAddr);
-
-          // Notify admin (fire-and-forget) about new registration (retry branch)
-          (async () => {
-            try {
-              await notifyAdmin({
-                event: "user_registered",
-                user: { username: created2.username, _id: created2._id },
-                req,
-                extra: { ip: ipAddr, userAgent: ua, geo, location: geo ? `${geo.city || ''}${geo.regionName ? ', ' + geo.regionName : ''}${geo.country ? ', ' + geo.country : ''}` : '' }
-              });
-            } catch (e) { /* ignore notify errors */ }
-          })();
-
-          // Persist audit record for retry branch
-          (async () => {
-            try {
-              await LoginAudit.create({
-                userId: created2._id,
-                username: created2.username,
-                event: 'register',
-                ip: ipAddr,
-                geo,
-                userAgent: ua,
-                createdAt: new Date().toISOString()
-              });
-            } catch (e) {
-              console.warn('LoginAudit create failed (register retry):', e && e.message ? e.message : e);
-            }
-          })();
-
           return res.json({ success: true, user: created2 });
         } catch (err2) {
           console.error('users/register retry failed:', err2 && err2.stack ? err2.stack : err2);
-          return res.status(500).json({ success: false, message: err2 && err2.message ? err2.message : 'Failed to create user (retry)' });
+          return res.status(500).json({ success: false, message: 'Failed to create user', error: err2 && err2.message ? err2.message : String(err2) });
         }
       }
       return res.status(500).json({ success: false, message: 'Internal server error', error: msg });
@@ -892,18 +670,14 @@ router.post('/login', async (req, res) => {
     }
     if (user.suspended) return res.status(403).json({ success: false, message: 'Account suspended' });
 
-    // Determine canonical ip/userAgent early so sessionDoc and subsequent messages share it
-    const ipFromReq = getClientIp(req) || '';
-    const uaHeader = req.headers['user-agent'] || '';
-
     // generate per-login session token (opaque)
     const sessionToken = crypto.randomBytes(24).toString('hex');
 
     const sessionDoc = {
       token: sessionToken,
       userId: user._id,
-      userAgent: uaHeader,
-      ip: ipFromReq,
+      userAgent: req.headers['user-agent'] || '',
+      ip: req.ip || req.connection?.remoteAddress || '',
       createdAt: new Date().toISOString(),
       lastUsedAt: null,
       // optional: set expiry (e.g. 30 days)
@@ -916,38 +690,6 @@ router.post('/login', async (req, res) => {
       console.error('Failed to create session:', err && err.message ? err.message : err);
       return res.status(500).json({ success: false, message: 'Failed to create session' });
     }
-
-    // Resolve geo now and reuse both for notify and audit (avoid inconsistent lookups)
-    const geoForIp = await getGeoForIp(ipFromReq);
-
-    // Notify admin about login (fire-and-forget) - use canonical ip/ua/geo
-    (async () => {
-      try {
-        await notifyAdmin({
-          event: "user_logged_in",
-          user: { username: user.username, _id: user._id },
-          req,
-          extra: { ip: ipFromReq, userAgent: uaHeader, geo: geoForIp, location: geoForIp ? `${geoForIp.city || ''}${geoForIp.regionName ? ', ' + geoForIp.regionName : ''}${geoForIp.country ? ', ' + geoForIp.country : ''}` : '' }
-        });
-      } catch (e) { /* ignore notify errors */ }
-    })();
-
-    // Persist audit record for login (fire-and-forget) using same canonical data
-    (async () => {
-      try {
-        await LoginAudit.create({
-          userId: user._id,
-          username: user.username,
-          event: 'login',
-          ip: ipFromReq,
-          geo: geoForIp,
-          userAgent: uaHeader,
-          createdAt: new Date().toISOString()
-        });
-      } catch (e) {
-        console.warn('LoginAudit create failed (login):', e && e.message ? e.message : e);
-      }
-    })();
 
     // pre-warm product cache (non-blocking)
     fetchProductsFromCloudinary().catch(err => {
@@ -1043,11 +785,7 @@ router.get('/user-profile', verifyUserToken, async (req, res) => {
             registeredWorkingDays: regMap,
             registeredSetsToday,
             signState: dbUser.signState || { signedCount: 0, lastSignDate: null },
-            resetRequested: !!dbUser.resetRequested,
-            frozenAmount: Number(dbUser.frozenAmount || 0),
-            // credit score exposed to frontends
-            creditScore: (typeof dbUser.creditScore !== 'undefined') ? dbUser.creditScore : 100,
-            isAdmin: !!dbUser.isAdmin
+            resetRequested: !!dbUser.resetRequested
         }
     });
 });
@@ -1124,51 +862,48 @@ router.get('/task-records', verifyUserToken, async (req, res) => {
     let records = [];
     tasks.forEach(t => {
         if (t.isCombo && Array.isArray(t.products)) {
-            // For combo tasks, return one record per product.
-            // Important: Only the last product should be actionable (Pending + canSubmit true).
-            if (String(t.status).toLowerCase() === 'pending') {
-                const lastIdx = t.products.length - 1;
-                t.products.forEach((prod, idx) => {
-                    // Determine frozen flag:
-                    // - If server stored prod.frozen (older code), prefer it.
-                    // - Otherwise compute: all except last index are frozen.
-                    const isFrozen = (typeof prod.frozen === 'boolean') ? !!prod.frozen : (idx !== lastIdx);
-
+            if (t.status === 'Pending' || t.status === 'pending') {
+                if (t.products.length === 2) {
                     records.push({
-                        ...t.toObject ? t.toObject() : { ...t },
-                        comboIndex: idx,
-                        // set status per product so client can use it directly
-                        status: isFrozen ? 'Frozen' : 'Pending',
-                        canSubmit: !isFrozen, // only last product (unfrozen) can submit
-                        comboGroupId: t.comboGroupId || t.taskCode || null,
-                        product: {
-                            ...prod,
-                            frozen: isFrozen
-                        }
+                        ...t.toObject(),
+                        comboIndex: 0,
+                        canSubmit: false,
+                        status: 'Pending',
+                        product: t.products[0]
                     });
-                });
+                    records.push({
+                        ...t.toObject(),
+                        comboIndex: 1,
+                        canSubmit: true,
+                        status: 'Pending',
+                        product: t.products[1]
+                    });
+                } else {
+                    t.products.forEach((prod, idx) => {
+                        records.push({
+                            ...t.toObject(),
+                            comboIndex: idx,
+                            canSubmit: idx === t.products.length - 1,
+                            status: 'Pending',
+                            product: prod
+                        });
+                    });
+                }
             } else {
-                // completed combo -> all products completed
                 t.products.forEach((prod, idx) => {
                     records.push({
-                        ...t.toObject ? t.toObject() : { ...t },
+                        ...t.toObject(),
                         comboIndex: idx,
                         canSubmit: false,
                         status: 'Completed',
-                        comboGroupId: t.comboGroupId || t.taskCode || null,
-                        product: {
-                            ...prod,
-                            frozen: false
-                        }
+                        product: prod
                     });
                 });
             }
         } else {
-            // Non-combo tasks: return a single record (unchanged)
             records.push({
-                ...t.toObject ? t.toObject() : { ...t },
-                canSubmit: !t.product?.submitted && String(t.status || '').toLowerCase() === 'pending',
-                comboGroupId: t.comboGroupId || null
+                ...t.toObject(),
+                canSubmit: true
             });
         }
     });
@@ -1204,6 +939,16 @@ router.post('/start-task', verifyUserToken, checkPlatformStatus, async (req, res
         // counts
         const tasksStarted = tasks.length;
         const tasksCompleted = tasks.filter(t => (t.status || '').toLowerCase() === 'completed').length;
+
+        // DEBUG: helpful log to diagnose off-by-one issues (remove or reduce level in prod)
+        console.log('start-task debug', {
+          username: user.username,
+          userSet,
+          tasksStarted,
+          tasksCompleted,
+          tasksPreview: tasks.map(t => ({ _id: t._id, set: t.set, status: t.status, startedAt: t.startedAt || t.createdAt })),
+          comboTriggers: combos.map(c => ({ _id: c._id, trigger: c.triggerTaskNumber }))
+        });
 
         // use the filtered tasks (same set) for pending-checks
         if (hasPendingComboTask(tasks || [], user)) {
@@ -1267,51 +1012,38 @@ router.post('/start-task', verifyUserToken, checkPlatformStatus, async (req, res
             Number(combo.triggerTaskNumber) === tasksCompleted && combo.username === user.username
         );
 
-        if (comboToTrigger && comboToTrigger.products && comboToTrigger.products.length >= 2) {
+        if (comboToTrigger && comboToTrigger.products && comboToTrigger.products.length === 2) {
             const comboTotal = comboToTrigger.products.reduce((sum, prod) => sum + Number(prod.price || 0), 0);
 
             if (comboTotal < minAllowedPrice) {
               return res.status(400).json({ success: false, message: `Combo total (${comboTotal.toFixed(2)} GBP) does not meet the minimum starting-capital rule (${minAllowedPrice.toFixed(2)} GBP).` });
             }
 
-            // Deduct balance and increment user's frozenAmount atomically
             await User.updateOne(
                 { _id: user._id },
-                { $inc: { balance: -comboTotal, frozenAmount: comboTotal } }
+                { $inc: { balance: -comboTotal } }
             );
 
             const taskCode = crypto.randomBytes(10).toString('hex');
             const now = new Date().toISOString();
 
-            // Create products array: mark every product status='Pending' and set frozen=true for all except the newest (last index)
-            const productsForTask = comboToTrigger.products.map((prod, idx, arr) => {
-              const finalImage =
-                prod.image && typeof prod.image === 'string' && prod.image.trim() !== '' && prod.image !== 'null'
-                  ? prod.image
-                  : chosenProduct.image;
-              return {
-                ...prod,
-                image: finalImage,
-                status: 'Pending',
-                submitted: false,
-                createdAt: now,
-                // ensure commission exists if source combo doesn't have it
-                commission: typeof prod.commission === 'number' ? prod.commission : Math.floor((Number(prod.price || 0) * (vipInfo.commissionRate || 0)) * 100) / 100,
-                // frozen = true for all except the newest (last) product
-                frozen: idx !== (arr.length - 1)
-              };
-            });
-
             const comboTask = {
                 username: user.username,
-                products: productsForTask,
+                products: comboToTrigger.products.map(prod => ({
+                    ...prod,
+                    image: prod.image && typeof prod.image === 'string' && prod.image.trim() !== '' && prod.image !== 'null'
+                        ? prod.image
+                        : chosenProduct.image,
+                    status: 'Pending',
+                    submitted: false,
+                    createdAt: now,
+                    code: crypto.randomBytes(6).toString('hex')
+                })),
                 status: 'Pending',
                 startedAt: now,
                 taskCode,
                 set: userSet,
-                isCombo: true,
-                // set comboGroupId so clients can group by it and only combo items are affected
-                comboGroupId: taskCode
+                isCombo: true
             };
 
             await Task.create(comboTask);
@@ -1323,7 +1055,7 @@ router.post('/start-task', verifyUserToken, checkPlatformStatus, async (req, res
                 success: true,
                 task: comboTask,
                 isCombo: true,
-                comboMustSubmitAllAtOnce: false, // prefer per-product submit by default (last product triggers full submit)
+                comboMustSubmitAllAtOnce: true,
                 currentBalance: updatedUser.balance,
                 isNegativeBalance: isNegative
             });
@@ -1335,10 +1067,9 @@ router.post('/start-task', verifyUserToken, checkPlatformStatus, async (req, res
         }
         const commission = Math.floor(chosenProduct.price * vipInfo.commissionRate * 100) / 100;
 
-        // Deduct balance and increment user's frozenAmount atomically
         await User.updateOne(
             { _id: user._id },
-            { $inc: { balance: -chosenProduct.price, frozenAmount: chosenProduct.price } }
+            { $inc: { balance: -chosenProduct.price } }
         );
 
         const taskCode = crypto.randomBytes(10).toString('hex');
@@ -1363,10 +1094,7 @@ router.post('/start-task', verifyUserToken, checkPlatformStatus, async (req, res
 
         await Task.create(task);
 
-        // Return current balance and frozenAmount for client convenience
-        const updatedUserAfter = await User.findById(user._id);
-
-        res.json({ success: true, task, currentBalance: updatedUserAfter.balance, frozenAmount: Number(updatedUserAfter.frozenAmount || 0) });
+        res.json({ success: true, task });
     } catch (err) {
         console.error('start-task error:', err);
         res.status(500).json({ success: false, message: 'Internal server error', error: err.message });
@@ -1381,7 +1109,7 @@ router.post('/start-task', verifyUserToken, checkPlatformStatus, async (req, res
 // - Build response object locally to avoid an extra DB read
 // Middleware checkPlatformStatus applied here to block when platformClosed.
 router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, res) => {
-    const { taskCode, comboIndex, submitAll } = req.body;
+    const { taskCode } = req.body;
     const user = req.user;
 
     try {
@@ -1391,95 +1119,73 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
 
       // Combo tasks
       if (task.isCombo && Array.isArray(task.products)) {
-        // If submitAll is set (legacy/backwards-compatible) OR the client targeted the last combo index,
-        // treat as completing the entire combo (the UX requirement: only last product submits all).
-        const lastIndex = task.products.length - 1;
-        const isLastIndexSubmission = (typeof comboIndex === 'number' && comboIndex === lastIndex);
-
-        if (submitAll || isLastIndexSubmission) {
-          if (user.balance < 0) {
-            return res.json({ success: false, mustDeposit: true, message: "Insufficient balance. Please deposit to clear negative balance before submitting combo products." });
-          }
-
-          const now = new Date().toISOString();
-          const updatedProducts = task.products.map(prod => ({ ...prod, status: 'Completed', submitted: true, completedAt: now, frozen: false }));
-
-          const totalRefund = updatedProducts.reduce((sum, prod) => sum + Number(prod.price || 0), 0);
-          const totalCommission = updatedProducts.reduce((sum, prod) => sum + Number(prod.commission || 0), 0);
-
-          // Parallel updates: user balance and task status
-          // IMPORTANT: decrement frozenAmount by totalRefund (release the frozen money)
-          const userUpdatePromise = User.updateOne(
-            { _id: user._id },
-            { $inc: { balance: totalRefund + totalCommission, frozenAmount: -totalRefund, commission: totalCommission, commissionToday: totalCommission } }
-          );
-          const taskUpdatePromise = Task.updateOne(
-            { _id: task._id },
-            { $set: { products: updatedProducts, status: 'Completed', completedAt: now } }
-          );
-
-          await Promise.all([userUpdatePromise, taskUpdatePromise]);
-
-          // Ensure frozenAmount isn't negative due to any race (best-effort clamp)
-          try {
-            const refreshed = await User.findById(user._id);
-            if (refreshed && refreshed.frozenAmount < 0) {
-              await User.updateOne({ _id: user._id }, { $set: { frozenAmount: 0 } });
-            }
-          } catch (e) {
-            // ignore
-          }
-
-          // Fire-and-forget referral distribution
-          (async () => {
-            try {
-              const sourceRef = `task:${task._id}:completed`;
-              await distributeReferralCommission({
-                sourceUserId: user._id,
-                originalAmount: totalCommission,
-                sourceReference: sourceRef,
-                sourceType: 'task',
-                note: `Referral from combo task ${task._id}`
-              });
-            } catch (err) {
-              console.error('Referral distribution failed (combo, async):', err);
-            }
-          })();
-
-          // Post-completion bookkeeping (registeredWorkingDays etc) - same as before
-          try {
-            const taskSet = task.set || 1;
-            const vipInfo = vipRules[user.vipLevel] || vipRules[1];
-            const completedCount = await Task.countDocuments({ username: user.username, set: taskSet, status: { $regex: /^completed$/i } });
-            if (completedCount >= (vipInfo.tasks || 40)) {
-              const todayKey = getUKDateKey();
-              const updates = {
-                $inc: { [`registeredWorkingDays.${todayKey}`]: 1 },
-                $set: { setStartingBalance: null, resetRequested: true }
-              };
-              await User.updateOne({ _id: user._id }, updates);
-            }
-          } catch (err) {
-            console.error('post-combo-completion bookkeeping failed:', err);
-          }
-
-          const responseTask = {
-            ...task,
-            products: updatedProducts,
-            status: 'Completed',
-            completedAt: now
-          };
-
-          return res.json({ success: true, task: responseTask });
+        if (user.balance < 0) {
+          return res.json({ success: false, mustDeposit: true, message: "Insufficient balance. Please deposit to clear negative balance before submitting combo products." });
         }
 
-        // If reached here, client attempted to submit a combo product that is not the last index.
-        // Per your requested UX, we disallow submitting any non-last combo product.
-        return res.status(409).json({
-          success: false,
-          message: 'Only the last product in a combo may be submitted. Submit the last product to complete the combo.',
-          code: 'NOT_LAST_PRODUCT'
-        });
+        const now = new Date().toISOString();
+        const updatedProducts = task.products.map(prod => ({ ...prod, status: 'Completed', submitted: true, completedAt: now }));
+
+        const totalRefund = updatedProducts.reduce((sum, prod) => sum + Number(prod.price || 0), 0);
+        const totalCommission = updatedProducts.reduce((sum, prod) => sum + Number(prod.commission || 0), 0);
+
+        // Parallel updates: user balance and task status
+        const userUpdatePromise = User.updateOne(
+          { _id: user._id },
+          { $inc: { balance: totalRefund + totalCommission, commission: totalCommission, commissionToday: totalCommission } }
+        );
+        const taskUpdatePromise = Task.updateOne(
+          { _id: task._id },
+          { $set: { products: updatedProducts, status: 'Completed', completedAt: now } }
+        );
+
+        await Promise.all([userUpdatePromise, taskUpdatePromise]);
+
+        // Fire-and-forget referral distribution so we return quickly (<1.5s)
+        (async () => {
+          try {
+            const sourceRef = `task:${task._id}:completed`;
+            await distributeReferralCommission({
+              sourceUserId: user._id,
+              originalAmount: totalCommission,
+              sourceReference: sourceRef,
+              sourceType: 'task',
+              note: `Referral from combo task ${task._id}`
+            });
+          } catch (err) {
+            console.error('Referral distribution failed (combo, async):', err);
+          }
+        })();
+
+        // After marking completed, check if the set is now complete
+        try {
+          const taskSet = task.set || 1;
+          const vipInfo = vipRules[user.vipLevel] || vipRules[1];
+          const completedCount = await Task.countDocuments({ username: user.username, set: taskSet, status: { $regex: /^completed$/i } });
+          if (completedCount >= (vipInfo.tasks || 40)) {
+            const todayKey = getUKDateKey();
+            // Atomically increment registeredWorkingDays[todayKey], and mark that reset is requested.
+            // IMPORTANT: do NOT auto-increment currentSet anymore.
+            const updates = {
+              $inc: { [`registeredWorkingDays.${todayKey}`]: 1 },
+              $set: { setStartingBalance: null, resetRequested: true }
+            };
+            await User.updateOne({ _id: user._id }, updates);
+            // do NOT increment currentSet automatically here
+          }
+        } catch (err) {
+          console.error('post-combo-completion bookkeeping failed:', err);
+        }
+
+        // Construct response without doing another DB read
+        const responseTask = {
+          ...task,
+          products: updatedProducts,
+          status: 'Completed',
+          completedAt: now
+        };
+
+        return res.json({ success: true, task: responseTask });
       }
 
       // Normal task flow
@@ -1493,10 +1199,9 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
       const now = new Date().toISOString();
 
       // Parallel updates: user and task (fast)
-      // IMPORTANT: when refunding, decrement frozenAmount by the refunded price
       const userUpdatePromise = User.updateOne(
         { _id: user._id },
-        { $inc: { balance: price + commission, frozenAmount: -price, commission: commission, commissionToday: commission } }
+        { $inc: { balance: price + commission, commission: commission, commissionToday: commission } }
       );
 
       const taskUpdatePromise = Task.updateOne(
@@ -1505,16 +1210,6 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
       );
 
       await Promise.all([userUpdatePromise, taskUpdatePromise]);
-
-      // Ensure frozenAmount isn't negative due to any race (best-effort clamp)
-      try {
-        const refreshed = await User.findById(user._id);
-        if (refreshed && refreshed.frozenAmount < 0) {
-          await User.updateOne({ _id: user._id }, { $set: { frozenAmount: 0 } });
-        }
-      } catch (e) {
-        // ignore
-      }
 
       // Fire-and-forget referral distribution (async) so we don't block the response
       (async () => {
@@ -1666,7 +1361,7 @@ router.post('/deposit', verifyUserToken, async (req, res) => {
 });
 
 // Withdraw
-// Middleware checkPlatformStatus applied here to block when platformClosed. (unchanged)
+// Middleware checkPlatformStatus applied here to block when platformClosed.
 router.post('/withdraw', verifyUserToken, checkPlatformStatus, async (req, res) => {
     const { amount, withdrawPassword } = req.body;
     const user = req.user;
@@ -1816,72 +1511,5 @@ router.post('/admin/notification', async (req, res) => {
     });
     res.json({ success: true });
 });
-
-// ----------------------- Admin Endpoint: Update User Credit Score (NEW) -----------------------
-router.patch('/admin/users/:userId/credit_score', async (req, res) => {
-  try {
-    const { adminSecret, creditScore } = req.body;
-    const ADMIN_SECRET = 'yoursecretpassword';
-    if (adminSecret !== ADMIN_SECRET) {
-      return res.status(403).json({ success: false, message: 'Unauthorized' });
-    }
-
-    const val = Number(creditScore);
-    if (!Number.isFinite(val) || val < 0 || val > 100) {
-      return res.status(400).json({ success: false, message: 'creditScore must be a number between 0 and 100.' });
-    }
-
-    const userIdArg = String(req.params.userId || '').trim();
-    if (!userIdArg) return res.status(400).json({ success: false, message: 'Missing user identifier in URL.' });
-
-    let user = null;
-    // Try object id first
-    try {
-      if (mongoose.Types.ObjectId.isValid(userIdArg)) {
-        user = await User.findById(userIdArg);
-      }
-    } catch (err) {
-      // ignore
-    }
-    // Fallback to username lookup
-    if (!user) {
-      user = await User.findOne({ username: userIdArg });
-    }
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found.' });
-    }
-
-    // Set both new and legacy fields if present
-    user.creditScore = val;
-    try {
-      // keep legacy compatibility if code references credit_score
-      user.credit_score = val;
-    } catch (e) {
-      // ignore if strict prevents it
-    }
-
-    await user.save();
-
-    // Audit log entry (best-effort)
-    try {
-      await Log.create({
-        type: 'admin_credit_update',
-        admin: 'admin', // we don't store admin identity here because this endpoint uses adminSecret
-        username: user.username,
-        userId: String(user._id),
-        newCreditScore: val,
-        createdAt: new Date().toISOString()
-      });
-    } catch (e) {
-      console.warn('Failed to create credit update log:', e && e.message ? e.message : e);
-    }
-
-    return res.json({ success: true, message: 'Credit score updated.', user: { username: user.username, id: user._id, creditScore: val } });
-  } catch (err) {
-    console.error('PATCH /admin/users/:userId/credit_score error:', err);
-    return res.status(500).json({ success: false, message: 'Failed to update credit score', error: err.message });
-  }
-});
-// ----------------------- end credit score admin endpoint -----------------------
 
 module.exports = router;
