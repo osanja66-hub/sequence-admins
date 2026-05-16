@@ -1094,7 +1094,15 @@ router.post('/start-task', verifyUserToken, checkPlatformStatus, async (req, res
 
         await Task.create(task);
 
-        res.json({ success: true, task });
+        // Fetch updated user so client can update balance immediately (prevents stale UI)
+        try {
+          const updatedUser = await User.findById(user._id).lean();
+          return res.json({ success: true, task, currentBalance: updatedUser.balance, commissionToday: updatedUser.commissionToday });
+        } catch (err) {
+          // On any error fetching updated user, still return success with task (best-effort)
+          console.warn('start-task: failed to fetch updated user for response:', err && err.message ? err.message : err);
+          return res.json({ success: true, task });
+        }
     } catch (err) {
         console.error('start-task error:', err);
         res.status(500).json({ success: false, message: 'Internal server error', error: err.message });
@@ -1185,7 +1193,14 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
           completedAt: now
         };
 
-        return res.json({ success: true, task: responseTask });
+        // Fetch updated user so client can update balance/commission immediately
+        try {
+          const updatedUser = await User.findById(user._id).lean();
+          return res.json({ success: true, task: responseTask, currentBalance: updatedUser.balance, commissionToday: updatedUser.commissionToday });
+        } catch (err) {
+          console.warn('submit-task (combo): failed to fetch updated user for response:', err && err.message ? err.message : err);
+          return res.json({ success: true, task: responseTask });
+        }
       }
 
       // Normal task flow
@@ -1257,7 +1272,14 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
         }
       };
 
-      return res.json({ success: true, task: responseTask });
+      // Fetch updated user so client can update balance/commission immediately
+      try {
+        const updatedUser = await User.findById(user._id).lean();
+        return res.json({ success: true, task: responseTask, currentBalance: updatedUser.balance, commissionToday: updatedUser.commissionToday });
+      } catch (err) {
+        console.warn('submit-task (single): failed to fetch updated user for response:', err && err.message ? err.message : err);
+        return res.json({ success: true, task: responseTask });
+      }
     } catch (err) {
       console.error('submit-task error:', err);
       return res.status(500).json({ success: false, message: 'Internal server error', error: err.message });
