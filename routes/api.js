@@ -742,39 +742,62 @@ router.post('/bind-wallet', verifyUserToken, async (req, res) => {
 
 // User profile
 router.get('/user-profile', verifyUserToken, async (req, res) => {
-    const dbUser = await User.findOne({ username: req.user.username });
-    if (!dbUser) return res.status(404).json({ success: false, message: "User not found" });
+    try {
+        // Fetch user fresh from DB
+        const dbUser = await User.findOne({ username: req.user.username }).lean();
+        if (!dbUser) return res.status(404).json({ success: false, message: "User not found" });
 
-    if (typeof dbUser.currentSet !== "number") dbUser.currentSet = 1;
+        // Make sure types/defaults
+        const userSet = (typeof dbUser.currentSet === "number") ? dbUser.currentSet : 1;
+        const vipInfo = vipRules[dbUser.vipLevel] || vipRules[1];
 
-    // --- Midnight commission reset safety (use UK day) ---
-    const todayStr = getUKDateKey();
-    if (dbUser.lastCommissionReset !== todayStr) {
-        dbUser.commissionToday = 0;
-        dbUser.lastCommissionReset = todayStr;
-        await dbUser.save();
-    }
+        // --- Midnight commission reset safety (use UK day) ---
+        // Use a lightweight update if needed (avoid fetching unrelated collections)
+        const todayStr = getUKDateKey();
+        if (dbUser.lastCommissionReset !== todayStr) {
+          try {
+            await User.updateOne({ _id: dbUser._id }, { $set: { commissionToday: 0, lastCommissionReset: todayStr } });
+            dbUser.commissionToday = 0;
+            dbUser.lastCommissionReset = todayStr;
+          } catch (e) {
+            // ignore update errors; keep going with best-effort values
+          }
+        }
 
-    const tasks = await Task.find({});
-    const userSet = dbUser.currentSet || 1;
-    const vipInfo = vipRules[dbUser.vipLevel] || vipRules[1];
-    const taskCountThisSet = tasks.filter(
-        t => t.username === dbUser.username && t.status?.toLowerCase() === "completed" && (t.set || 1) === userSet
-    ).length;
+        // Efficient counts: query only for this user's tasks in their current set
+        let taskCountThisSet = 0;
+        try {
+          if (userSet === 1) {
+            taskCountThisSet = await Task.countDocuments({
+              username: dbUser.username,
+              $or: [{ set: 1 }, { set: { $exists: false } }],
+              status: { $regex: /^completed$/i }
+            });
+          } else {
+            taskCountThisSet = await Task.countDocuments({
+              username: dbUser.username,
+              set: userSet,
+              status: { $regex: /^completed$/i }
+            });
+          }
+        } catch (e) {
+          // if counting fails for any reason, fallback to zero (avoid crashing)
+          console.warn('user-profile: task countDocuments failed:', e && e.message ? e.message : e);
+          taskCountThisSet = 0;
+        }
 
-    // Get registered sets count for today from stored map
-    const regMap = dbUser.registeredWorkingDays || {};
-    const registeredSetsToday = regMap[todayStr] || 0;
+        // Get registered sets count for today from stored map
+        const regMap = dbUser.registeredWorkingDays || {};
+        const registeredSetsToday = regMap[todayStr] || 0;
 
-    res.json({
-        success: true,
-        user: {
+        // Build and return compact user object (fast)
+        const safeUser = {
             username: dbUser.username,
-            balance: dbUser.balance ?? 0,
+            balance: typeof dbUser.balance === 'number' ? dbUser.balance : 0,
             vipLevel: dbUser.vipLevel ?? 1,
-            commissionToday: dbUser.commissionToday ?? 0,
+            commissionToday: typeof dbUser.commissionToday === 'number' ? dbUser.commissionToday : 0,
             taskCountThisSet,
-            currentSet: dbUser.currentSet ?? 1,
+            currentSet: userSet,
             maxTasks: vipInfo.tasks,
             inviteCode: dbUser.inviteCode ?? "",
             referredBy: dbUser.referredBy ?? "",
@@ -786,8 +809,13 @@ router.get('/user-profile', verifyUserToken, async (req, res) => {
             registeredSetsToday,
             signState: dbUser.signState || { signedCount: 0, lastSignDate: null },
             resetRequested: !!dbUser.resetRequested
-        }
-    });
+        };
+
+        return res.json({ success: true, user: safeUser });
+    } catch (err) {
+        console.error('user-profile error:', err && err.message ? err.message : err);
+        return res.status(500).json({ success: false, message: 'Internal server error', error: err.message });
+    }
 });
 
 // Sign-in endpoint: persist sign state server-side for cross-device sync
@@ -1094,7 +1122,15 @@ router.post('/start-task', verifyUserToken, checkPlatformStatus, async (req, res
 
         await Task.create(task);
 
-        res.json({ success: true, task });
+        // Fetch updated user so client can update balance immediately (prevents stale UI)
+        try {
+          const updatedUser = await User.findById(user._id).lean();
+          return res.json({ success: true, task, currentBalance: updatedUser.balance, commissionToday: updatedUser.commissionToday });
+        } catch (err) {
+          // On any error fetching updated user, still return success with task (best-effort)
+          console.warn('start-task: failed to fetch updated user for response:', err && err.message ? err.message : err);
+          return res.json({ success: true, task });
+        }
     } catch (err) {
         console.error('start-task error:', err);
         res.status(500).json({ success: false, message: 'Internal server error', error: err.message });
@@ -1185,7 +1221,14 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
           completedAt: now
         };
 
-        return res.json({ success: true, task: responseTask });
+        // Fetch updated user so client can update balance/commission immediately
+        try {
+          const updatedUser = await User.findById(user._id).lean();
+          return res.json({ success: true, task: responseTask, currentBalance: updatedUser.balance, commissionToday: updatedUser.commissionToday });
+        } catch (err) {
+          console.warn('submit-task (combo): failed to fetch updated user for response:', err && err.message ? err.message : err);
+          return res.json({ success: true, task: responseTask });
+        }
       }
 
       // Normal task flow
@@ -1257,7 +1300,14 @@ router.post('/submit-task', verifyUserToken, checkPlatformStatus, async (req, re
         }
       };
 
-      return res.json({ success: true, task: responseTask });
+      // Fetch updated user so client can update balance/commission immediately
+      try {
+        const updatedUser = await User.findById(user._id).lean();
+        return res.json({ success: true, task: responseTask, currentBalance: updatedUser.balance, commissionToday: updatedUser.commissionToday });
+      } catch (err) {
+        console.warn('submit-task (single): failed to fetch updated user for response:', err && err.message ? err.message : err);
+        return res.json({ success: true, task: responseTask });
+      }
     } catch (err) {
       console.error('submit-task error:', err);
       return res.status(500).json({ success: false, message: 'Internal server error', error: err.message });
