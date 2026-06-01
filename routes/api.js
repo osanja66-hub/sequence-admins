@@ -39,7 +39,18 @@ const userSchema = new mongoose.Schema({
   signState: { type: mongoose.Schema.Types.Mixed, default: { signedCount: 0, lastSignDate: null } },
 
   // Manual reset flag: user requests reset for next set (must be processed by admin or via explicit endpoint)
-  resetRequested: { type: Boolean, default: false }
+  resetRequested: { type: Boolean, default: false },
+
+  // --- Credit / credibility fields (added so user-profile can return them to frontend) ---
+  // Numeric canonical score (0..100)
+  creditScore: { type: Number, default: 100 },
+  // Numeric alias as some platforms may call it credibility
+  credibility: { type: Number, default: 100 },
+  // Optional string form (e.g. "100%") for backwards compatibility with some admin panels
+  credit: { type: String, default: "100%" },
+  // legacy field name alias
+  credibilityPercent: { type: Number, default: 100 }
+
 }, { collection: 'users', strict: false });
 
 const User = mongoose.models.User || mongoose.model('User', userSchema);
@@ -808,7 +819,18 @@ router.get('/user-profile', verifyUserToken, async (req, res) => {
             registeredWorkingDays: regMap,
             registeredSetsToday,
             signState: dbUser.signState || { signedCount: 0, lastSignDate: null },
-            resetRequested: !!dbUser.resetRequested
+            resetRequested: !!dbUser.resetRequested,
+            // --- Credit fields normalized for frontend consumption ---
+            // Prefer numeric creditScore (0..100), fallback to credibility / credibilityPercent, then derive from string credit
+            creditScore: (typeof dbUser.creditScore !== 'undefined' && dbUser.creditScore !== null) ? Number(dbUser.creditScore) :
+                         (typeof dbUser.credibility !== 'undefined' && dbUser.credibility !== null) ? Number(dbUser.credibility) :
+                         (typeof dbUser.credibilityPercent !== 'undefined' && dbUser.credibilityPercent !== null) ? Number(dbUser.credibilityPercent) :
+                         (typeof dbUser.credit === 'string' ? Number(String(dbUser.credit).replace('%','').trim()) : undefined),
+            credibility: (typeof dbUser.credibility !== 'undefined' && dbUser.credibility !== null) ? Number(dbUser.credibility) :
+                         (typeof dbUser.creditScore !== 'undefined' && dbUser.creditScore !== null) ? Number(dbUser.creditScore) : undefined,
+            credibilityPercent: (typeof dbUser.credibilityPercent !== 'undefined' && dbUser.credibilityPercent !== null) ? Number(dbUser.credibilityPercent) : (typeof dbUser.creditScore !== 'undefined' && dbUser.creditScore !== null ? Number(dbUser.creditScore) : undefined),
+            // raw string (if admin saved "100%")
+            credit: (typeof dbUser.credit === 'string' && dbUser.credit.trim()) ? dbUser.credit.trim() : (typeof dbUser.creditScore === 'number' ? String(dbUser.creditScore) + '%' : undefined)
         };
 
         return res.json({ success: true, user: safeUser });
