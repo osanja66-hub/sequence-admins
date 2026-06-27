@@ -26,9 +26,9 @@ const Setting = mongoose.models.Setting || mongoose.model('Setting', new mongoos
 
 // ========== Cloudinary Config ==========
 cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'dycytqdfj',
-    api_key: process.env.CLOUDINARY_API_KEY || '983286743251596',
-    api_secret: process.env.CLOUDINARY_API_SECRET || 'zeU4nedVzVzvqqndh2MF82AdRiI',
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'dnugrwwlu',
+    api_key: process.env.CLOUDINARY_API_KEY || '871378976832311',
+    api_secret: process.env.CLOUDINARY_API_SECRET || '2aTYuPuNhkZD6Ytjg7YseGLVfb4',
     secure: true
 });
 
